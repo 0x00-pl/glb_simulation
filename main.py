@@ -1,14 +1,14 @@
 import math
-import collections
+import typing
 
 
 class Instruction:
-    def __init__(self, operands:collections.Sequence['Instruction']=None):
+    def __init__(self, operands: typing.Sequence['Instruction']=None):
         operands = operands or []
         self.op = ""
         self.dt = 'float'
-        self.shape = (1,2,4,8)
-        self.operands:collections.Sequence[Instruction] = operands
+        self.shape = (1, 2, 4, 8)
+        self.operands: typing.Sequence[Instruction] = operands
 
 
 class Buffer:
@@ -18,23 +18,23 @@ class Buffer:
             self.sliced_pos = sliced_pos
             self.sliced_shape = sliced_shape
 
-    def __init__(self, instruction:Instruction, buffers:collections.abc.Collection['Buffer']=None):
+    def __init__(self, instruction:Instruction, buffers: typing.Collection['Buffer'] = None):
         self.instruction = instruction
         if self.instruction.op == 'slice':
             assert(buffers is not None)
-            slice_base =  Buffer.get_buffer_by_instruction(buffers, self.instruction.operands[0])
-            self.slice_info:Buffer.SliceInfo = Buffer.SliceInfo(slice_base, [0,0,0,0], [1,1,1,1])
+            slice_base = Buffer.get_buffer_by_instruction(buffers, self.instruction.operands[0])
+            self.slice_info: Buffer.SliceInfo = Buffer.SliceInfo(slice_base, [0, 0, 0, 0], [1, 1, 1, 1])
         else:
-            self.slice_info:Buffer.SliceInfo = None
+            self.slice_info: Buffer.SliceInfo = None
 
     @staticmethod
-    def get_buffer_by_instruction(buffers:collections.abc.Collection['Buffer'], instruction:Instruction) -> 'Buffer':
+    def get_buffer_by_instruction(buffers: typing.Collection['Buffer'], instruction: Instruction) -> 'Buffer':
         for buffer in buffers:
             if id(buffer.instruction) == id(instruction):
                 return buffer
 
     @staticmethod
-    def init_buffers(instructions:collections.abc.Collection[Instruction]):
+    def init_buffers(instructions: typing.Collection[Instruction]):
         ret = []
         for instruction in instructions:
             ret.append(Buffer(instruction, ret))
@@ -43,9 +43,16 @@ class Buffer:
 
 
 class BufferAssignment:
-    def __init__(self, buffer:Buffer, address:int):
+    def __init__(self, buffer: Buffer, address: int):
         self.buffer = buffer
-        self.address:int = address
+        self.address: int = address
+
+
+class BufferLiveness:
+    def __init__(self, instructions: typing.Sequence[Instruction], buffers: typing.Collection[Buffer]):
+        self.timeline = instructions
+        self.liveness: typing.Tuple[Buffer, typing.Collection] = []
+
 
 
 def instructions_opt(instructions, buffers, buffer_assignments, buffer_liveness):
@@ -53,12 +60,12 @@ def instructions_opt(instructions, buffers, buffer_assignments, buffer_liveness)
 
 
 def main():
-    instructions:collections.abc.Collection[Instruction] = []
-    get_buffer_size:collections.Callable[[Buffer], int] = lambda buffer: 1
+    instructions: typing.Sequence[Instruction] = []
+    get_buffer_size: typing.Callable[[Buffer], int] = lambda buffer: 1
 
     buffers = Buffer.init_buffers(instructions)
 
-    buffer_liveness = BufferLiveness(buffers, [])
+    buffer_liveness = BufferLiveness(instructions, buffers)
 
     [instructions_glb_assignment, buffer_glb_assignments] = assignment_glb(instructions, buffer_liveness, get_buffer_size)
     [instructions_glb_assignment_opt, buffers_opt, buffer_glb_assignments_opt] = instructions_opt(instructions_glb_assignment, buffers, buffer_glb_assignments, buffer_liveness)
@@ -66,10 +73,10 @@ def main():
     buffers = buffers_opt
     buffer_glb_assignments = buffer_glb_assignments_opt
 
-    buffer_liveness_ddr_only = BufferLiveness(buffers, [i.buffer for i in buffer_glb_assignments])
-    [instructions_ddr_assignment, buffer_ddr_assignments] = assignment_ddr(instructions, buffer_liveness_ddr_only, get_buffer_size)
+    buffer_liveness = BufferLiveness(instructions, buffers)
+    buffer_ddr_assignments = assignment_ddr(instructions, buffer_liveness, buffer_glb_assignments, get_buffer_size)
 
-    return [instructions_ddr_assignment, buffer_glb_assignments, buffer_ddr_assignments]
+    return [instructions, buffer_glb_assignments, buffer_ddr_assignments]
 
 
 
