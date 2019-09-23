@@ -48,6 +48,10 @@ class BufferAssignment:
         self.address:int = address
 
 
+def instructions_opt(instructions, buffers, buffer_assignments, buffer_liveness):
+    return [instructions, buffers, buffer_assignments]
+
+
 def main():
     instructions:collections.abc.Collection[Instruction] = []
     get_buffer_size:collections.Callable[[Buffer], int] = lambda buffer: 1
