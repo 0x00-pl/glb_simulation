@@ -65,23 +65,109 @@ class BufferLiveness:
         def add_uses(self, idx: int, instruction: Instruction):
             self.uses[idx] = instruction
 
-    def __init__(self, instructions: typing.Sequence[Instruction], buffers: typing.Collection[Buffer]):
+    def __init__(
+            self, instructions: typing.Sequence[Instruction], buffers: typing.Collection[Buffer],
+            get_buffer_size: typing.Callable[[Buffer], int] = (lambda buffer: 1)
+    ):
+        self.get_buffer_size = get_buffer_size
         self.timeline = instructions
-        self.liveness: typing.Dict[Buffer, BufferLiveness.Liveness] = {}
+        self.livenesses: typing.Dict[Buffer, BufferLiveness.Liveness] = {}
         for idx, instruction in zip(range(len(instructions)), instructions):
             buffer = Buffer.get_buffer_by_instruction(buffers, instruction)
-            if buffer not in self.liveness.keys():
-                self.liveness[buffer] = BufferLiveness.Liveness()
+            if buffer not in self.livenesses.keys():
+                self.livenesses[buffer] = BufferLiveness.Liveness()
             else:
-                self.liveness[buffer].add_uses(idx, instruction)
+                self.livenesses[buffer].add_uses(idx, instruction)
+
+            for ins in instruction.operands
+                buf = Buffer.get_buffer_by_instruction(buffers, ins)
+                self.livenesses[buf].add_uses(idx, ins)
+
+    def buffer_is_alive_at_time(self, buffer, idx):
+        uses_idxs = self.livenesses[buffer].uses.keys()
+        return min(uses_idxs) <= idx <= max(uses_idxs)
+
+    def alive_buffers_at_time(self, idx):
+        return [
+            buffer
+            for buffer, liveness
+            in self.livenesses.items()
+            if self.buffer_is_alive_at_time(buffer, idx)
+        ]
+
+    def total_size_of_buffers(self, buffers):
+        return sum([self.get_buffer_size(i) for i in buffers])
+
+    def max_buffer_use(self, buffer_filter=None):
+        buffer_filter = buffer_filter or (lambda buffer: True)
+        max_size = 0
+        for idx in range(len(self.timeline)):
+            buffers = [
+                buffer
+                for buffer
+                in self.alive_buffers_at_time(idx)
+                if buffer_filter(buffer)
+            ]
+            max_size = max(max_size, self.total_size_of_buffers(buffers))
+
+        return max_size
 
 
 def instructions_opt(instructions, buffers, buffer_assignments, buffer_liveness):
     return [instructions, buffers, buffer_assignments]
 
 
-def assignment_glb(instructions, buffer_liveness, get_buffer_size):
+class GlbAllocator:
+    def __init__(self, mem_size: int):
+        self.mem_size: int = mem_size
+        self.free_mem_list: typing.Collection[typing.Tuple[int, int]] = [(0, self.mem_size)]
 
+    @staticmethod
+    def alloc_from_free_mem(free_mem: typing.Tuple[int, int], mem_size):
+        free_mem_size = free_mem[1] - free_mem[0]
+        assert (free_mem_size >= mem_size)
+        if free_mem_size == mem_size:
+            return None
+        else:
+            return free_mem[0] + mem_size, free_mem[1]
+
+    def free(self, free_mem: typing.Tuple[int, int]):
+        free_mem_list = []
+        for i in self.free_mem_list:
+            if i[1] == free_mem[0]:
+                free_mem = (i[0], free_mem[1])
+            elif i[0] == free_mem[1]:
+                free_mem = (free_mem[0], i[1])
+            else:
+                free_mem_list.append(i)
+
+        free_mem_list.append(free_mem)
+        self.free_mem_list = free_mem_list
+
+    def alloc(self, request_mem_size: int):
+        free_mem_list = []
+        for free_mem in self.free_mem_list:
+            if request_mem_size is None:
+                free_mem_list.append(free_mem)
+
+            free_mem_size = free_mem[1] - free_mem[0]
+            if request_mem_size == free_mem_size:
+                request_mem_size = None
+                # no rest_free_mem
+            elif request_mem_size < free_mem_size:
+                rest_free_mem = GlbAllocator.alloc_from_free_mem(free_mem, request_mem_size)
+                request_mem_size = None
+                free_mem_list.append(rest_free_mem)
+            else:
+                continue
+        if request_mem_size is None:
+            self.free_mem_list = free_mem_list
+            return True
+        else:
+            return False
+
+
+def assignment_glb(instructions: typing.Sequence[Instruction], buffer_liveness: BufferLiveness, get_buffer_size):
     return [instructions_glb_assignment, buffer_glb_assignments]
 
 
