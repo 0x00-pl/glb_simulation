@@ -1,9 +1,8 @@
-import math
 import typing
 
 
 class Instruction:
-    def __init__(self, operands: typing.Sequence['Instruction']=None):
+    def __init__(self, operands: typing.Sequence['Instruction'] = None):
         operands = operands or []
         self.op = ""
         self.dt = 'float'
@@ -12,20 +11,20 @@ class Instruction:
 
 
 class Buffer:
-    class SliceInfo:
-        def __init__(self, base_buffer, sliced_pos, sliced_shape):
-            self.base_buffer = base_buffer
-            self.sliced_pos = sliced_pos
-            self.sliced_shape = sliced_shape
+    # class SliceInfo:
+    #     def __init__(self, base_buffer, sliced_pos, sliced_shape):
+    #         self.base_buffer = base_buffer
+    #         self.sliced_pos = sliced_pos
+    #         self.sliced_shape = sliced_shape
 
-    def __init__(self, instruction:Instruction, buffers: typing.Collection['Buffer'] = None):
+    def __init__(self, instruction: Instruction, buffers: typing.Collection['Buffer'] = None):
         self.instruction = instruction
-        if self.instruction.op == 'slice':
-            assert(buffers is not None)
-            slice_base = Buffer.get_buffer_by_instruction(buffers, self.instruction.operands[0])
-            self.slice_info: Buffer.SliceInfo = Buffer.SliceInfo(slice_base, [0, 0, 0, 0], [1, 1, 1, 1])
-        else:
-            self.slice_info: Buffer.SliceInfo = None
+        # if self.instruction.op == 'slice':
+        #     assert(buffers is not None)
+        #     slice_base = Buffer.get_buffer_by_instruction(buffers, self.instruction.operands[0])
+        #     self.slice_info: Buffer.SliceInfo = Buffer.SliceInfo(slice_base, [0, 0, 0, 0], [1, 1, 1, 1])
+        # else:
+        #     self.slice_info: Buffer.SliceInfo = None
 
     @staticmethod
     def get_buffer_by_instruction(buffers: typing.Collection['Buffer'], instruction: Instruction) -> 'Buffer':
@@ -42,6 +41,16 @@ class Buffer:
         return ret
 
 
+class Computation:
+    def __init__(
+            self, instructions: typing.Sequence[Instruction], input_instructions: typing.Sequence[Instruction],
+            output_instruction: Instruction
+    ):
+        self.instructions = instructions
+        self.input_instructions = input_instructions
+        self.output_instruction = output_instruction
+
+
 class BufferAssignment:
     def __init__(self, buffer: Buffer, address: int):
         self.buffer = buffer
@@ -49,14 +58,31 @@ class BufferAssignment:
 
 
 class BufferLiveness:
+    class Liveness:
+        def __init__(self):
+            self.uses: typing.Dict[int, Instruction] = {}
+
+        def add_uses(self, idx: int, instruction: Instruction):
+            self.uses[idx] = instruction
+
     def __init__(self, instructions: typing.Sequence[Instruction], buffers: typing.Collection[Buffer]):
         self.timeline = instructions
-        self.liveness: typing.Tuple[Buffer, typing.Collection] = []
-
+        self.liveness: typing.Dict[Buffer, BufferLiveness.Liveness] = {}
+        for idx, instruction in zip(range(len(instructions)), instructions):
+            buffer = Buffer.get_buffer_by_instruction(buffers, instruction)
+            if buffer not in self.liveness.keys():
+                self.liveness[buffer] = BufferLiveness.Liveness()
+            else:
+                self.liveness[buffer].add_uses(idx, instruction)
 
 
 def instructions_opt(instructions, buffers, buffer_assignments, buffer_liveness):
     return [instructions, buffers, buffer_assignments]
+
+
+def assignment_glb(instructions, buffer_liveness, get_buffer_size):
+
+    return [instructions_glb_assignment, buffer_glb_assignments]
 
 
 def main():
@@ -67,8 +93,14 @@ def main():
 
     buffer_liveness = BufferLiveness(instructions, buffers)
 
-    [instructions_glb_assignment, buffer_glb_assignments] = assignment_glb(instructions, buffer_liveness, get_buffer_size)
-    [instructions_glb_assignment_opt, buffers_opt, buffer_glb_assignments_opt] = instructions_opt(instructions_glb_assignment, buffers, buffer_glb_assignments, buffer_liveness)
+    [instructions_glb_assignment, buffer_glb_assignments] = assignment_glb(
+        instructions, buffer_liveness, get_buffer_size
+    )
+
+    [instructions_glb_assignment_opt, buffers_opt, buffer_glb_assignments_opt] = instructions_opt(
+        instructions_glb_assignment, buffers, buffer_glb_assignments, buffer_liveness
+    )
+
     instructions = instructions_glb_assignment_opt
     buffers = buffers_opt
     buffer_glb_assignments = buffer_glb_assignments_opt
@@ -77,8 +109,6 @@ def main():
     buffer_ddr_assignments = assignment_ddr(instructions, buffer_liveness, buffer_glb_assignments, get_buffer_size)
 
     return [instructions, buffer_glb_assignments, buffer_ddr_assignments]
-
-
 
 # class GlbStatus:
 #     location_ty = int
@@ -118,7 +148,3 @@ def main():
 #
 #     def get_total_size(self):
 #         return sum(size for location, size in self.buffer_dict.values())
-
-
-
-
