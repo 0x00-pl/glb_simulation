@@ -230,6 +230,12 @@ def ensure_glb_space(
     return really_needs_to_be_swap
 
 
+def update_buffer_assignments(buffer_assignments: typing.Collection[BufferAssignment],
+                              new_buffers: typing.Collection[Buffer]):
+    for buffer_assignment in buffer_assignments:
+        buffer_assignment.buffer = Buffer.get_buffer_by_instruction(new_buffers, buffer_assignment.buffer.instruction)
+
+
 class GlbAssignmentState:
     def __init__(
             self, glb_size: int,
@@ -369,27 +375,136 @@ def assignment_glb(
     return [glb_state.instructions, glb_state.buffer_assignments]
 
 
+class DdrAllocator:
+    def __init__(self):
+        # self.buffer_assignments:typing.MutableSet[BufferAssignment] = set()
+        self.free_mem_list: typing.List[typing.List[int, int]] = []
+        self.max_mem_use: int = 0
+
+    def free(self, free_mem: typing.Tuple[int, int]):
+        free_mem_list = []
+        for i in self.free_mem_list:
+            if i[1] == free_mem[0]:
+                free_mem = (i[0], free_mem[1])
+            elif i[0] == free_mem[1]:
+                free_mem = (free_mem[0], i[1])
+            else:
+                free_mem_list.append(i)
+
+        free_mem_list.append(free_mem)
+        self.free_mem_list = free_mem_list
+
+    def alloc(self, request_mem_size: int) -> typing.Optional[typing.Tuple[int, int]]:
+        result = None
+        free_mem_list: typing.List[typing.List[int, int]] = []
+        bottom_free_mem = None
+        for free_mem in self.free_mem_list:
+            if free_mem[1] == self.max_mem_use:
+                bottom_free_mem = free_mem
+
+            if request_mem_size is None:
+                free_mem_list.append(free_mem)
+
+            free_mem_size = free_mem[1] - free_mem[0]
+            if request_mem_size == free_mem_size:
+                request_mem_size = None
+                result = free_mem
+                # no rest_free_mem
+            elif request_mem_size < free_mem_size:
+                rest_free_mem: typing.Tuple[int, int] = GlbAllocator.alloc_from_free_mem(tuple(*free_mem),
+                                                                                         request_mem_size)
+                assert (rest_free_mem is not None)
+                result = (free_mem[0] + request_mem_size, free_mem[1])
+                request_mem_size = None
+                free_mem_list.append(list(rest_free_mem))
+            else:
+                continue
+        if request_mem_size is None:
+            self.free_mem_list = free_mem_list
+            return result
+        else:
+            if bottom_free_mem:
+                lack_of_mem = request_mem_size - (bottom_free_mem[1] - bottom_free_mem[0])
+                bottom_free_mem[1] = bottom_free_mem[1] + lack_of_mem
+                self.max_mem_use = self.max_mem_use + lack_of_mem
+                self.free_mem_list.remove(bottom_free_mem)
+                return tuple(*bottom_free_mem)
+            else:
+                address = self.max_mem_use
+                self.max_mem_use = self.max_mem_use + request_mem_size
+                return address, request_mem_size
+
+
+def assignment_ddr(
+        instructions: typing.Sequence[Instruction],
+        buffers: typing.Collection[Buffer],
+        buffer_liveness: BufferLiveness,
+        glb_buffer_assignments: typing.Collection[BufferAssignment],
+        get_instruction_output_size: typing.Callable[[Instruction], int]
+):
+    update_buffer_assignments(glb_buffer_assignments, buffers)
+    allocator = DdrAllocator()
+    ddr_buffer_assignments: typing.MutableSet[BufferAssignment] = set()
+
+    def get_buffer_assignment_by_instruction(buffer_assignments, inst):
+        for buffer_assignment in buffer_assignments:
+            if buffer_assignment.buffer.instruction == inst:
+                return buffer_assignment
+        else:
+            return None
+
+    for idx, instruction in zip(range(len(instructions)), instructions):
+        # alloc instruction output memory if its not in glb
+        if get_buffer_assignment_by_instruction(glb_buffer_assignments, instruction):
+            pass  # this buffer is using glb not in ddr
+        else:
+            addr, mem_size = allocator.alloc(get_instruction_output_size(instruction))
+            ddr_buffer_assignments.add(BufferAssignment(Buffer(instruction), addr, mem_size))
+
+        # free dead operand instruction input memory
+        for operand_instruction in instruction.operands:
+            is_alive = buffer_liveness.buffer_is_alive_at_time(
+                Buffer.get_buffer_by_instruction(buffers, operand_instruction),
+                idx
+            )
+            if is_alive:
+                continue
+
+            if get_buffer_assignment_by_instruction(glb_buffer_assignments, operand_instruction):
+                pass  # this buffer is using glb not in ddr
+            else:
+                ddr_buffer_assignment = get_buffer_assignment_by_instruction(
+                    ddr_buffer_assignments,
+                    operand_instruction
+                )
+                allocator.free((ddr_buffer_assignment.address, ddr_buffer_assignment.mem_size))
+
+    update_buffer_assignments(ddr_buffer_assignments, buffers)
+    return ddr_buffer_assignments
+
+
 def main():
     instructions: typing.Sequence[Instruction] = []
-    get_buffer_size: typing.Callable[[Buffer], int] = lambda buffer: 1
+    get_instruction_output_size: typing.Callable[[Instruction], int] = lambda buffer: 1
 
     buffers = Buffer.init_buffers(instructions)
 
     buffer_liveness = BufferLiveness(instructions, buffers)
 
     [instructions_glb_assignment, buffer_glb_assignments] = assignment_glb(
-        instructions, buffers, buffer_liveness, get_buffer_size
+        instructions, buffers, buffer_liveness, get_instruction_output_size
     )
 
-    [instructions_glb_assignment_opt, buffers_opt, buffer_glb_assignments_opt] = instructions_opt(
-        instructions_glb_assignment, buffers, buffer_glb_assignments, buffer_liveness
+    [instructions_glb_assignment_opt, buffer_glb_assignments_opt] = instructions_opt(
+        instructions_glb_assignment, buffer_glb_assignments, buffer_liveness
     )
     instructions = instructions_glb_assignment_opt
-    buffers = buffers_opt
+    buffers = Buffer.init_buffers(instructions)
     buffer_glb_assignments = buffer_glb_assignments_opt
 
     buffer_liveness = BufferLiveness(instructions, buffers)
-    buffer_ddr_assignments = assignment_ddr(instructions, buffer_liveness, buffer_glb_assignments, get_buffer_size)
+    buffer_ddr_assignments = assignment_ddr(instructions, buffers, buffer_liveness, buffer_glb_assignments,
+                                            get_instruction_output_size)
 
     return [instructions, buffer_glb_assignments, buffer_ddr_assignments]
 
