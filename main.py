@@ -23,20 +23,8 @@ class Instruction:
 
 
 class Buffer:
-    # class SliceInfo:
-    #     def __init__(self, base_buffer, sliced_pos, sliced_shape):
-    #         self.base_buffer = base_buffer
-    #         self.sliced_pos = sliced_pos
-    #         self.sliced_shape = sliced_shape
-
-    def __init__(self, instruction: Instruction, buffers: typing.Collection['Buffer'] = None):
+    def __init__(self, instruction: Instruction):
         self.instruction = instruction
-        # if self.instruction.op == 'slice':
-        #     assert(buffers is not None)
-        #     slice_base = Buffer.get_buffer_by_instruction(buffers, self.instruction.operands[0])
-        #     self.slice_info: Buffer.SliceInfo = Buffer.SliceInfo(slice_base, [0, 0, 0, 0], [1, 1, 1, 1])
-        # else:
-        #     self.slice_info: Buffer.SliceInfo = None
 
     @staticmethod
     def get_buffer_by_instruction(buffers: typing.Collection['Buffer'], instruction: Instruction) -> 'Buffer':
@@ -48,7 +36,7 @@ class Buffer:
     def init_buffers(instructions: typing.Collection[Instruction]):
         ret = []
         for instruction in instructions:
-            ret.append(Buffer(instruction, ret))
+            ret.append(Buffer(instruction))
 
         return ret
 
@@ -64,10 +52,11 @@ class Computation:
 
 
 class BufferAssignment:
-    def __init__(self, buffer: Buffer, address: int, mem_size: int):
+    def __init__(self, buffer: Buffer, address: int, mem_size: int, meta_data=None):
         self.buffer = buffer
         self.address: int = address
         self.mem_size: int = mem_size
+        self.meta_data = meta_data
 
     def overlap(self, address, mem_size):
         return self.address < address + mem_size and address < self.address + self.mem_size
@@ -241,93 +230,143 @@ def ensure_glb_space(
     return really_needs_to_be_swap
 
 
-def assignment_glb_impl_request_resources(
-        request_input_buffers, request_output_mem_size, latest_used_ordered_buffers
-):
-    return [buffers_needs_to_be_store]
+class GlbAssignmentState:
+    def __init__(
+            self, glb_size: int,
+            get_instruction_output_size: typing.Callable[[Instruction], int]
+    ):
+        self.get_instruction_output_size = get_instruction_output_size
+        self.allocator = GlbAllocator(glb_size)
+        self.instructions: typing.List[Instruction] = []
+        self.buffer_assignments: typing.MutableSet[BufferAssignment] = set()
+        self.buffer_assignments_ddr: typing.List[BufferAssignment] = []
+        self.instruction_domain_mapping: typing.Dict[Instruction, Instruction] = {}
 
+    def get_buffer_assignment_by_instruction(self, instruction):
+        for buffer_assignment in self.buffer_assignments:
+            if buffer_assignment.buffer.instruction == instruction:
+                return buffer_assignment
+        else:
+            return None
 
-def assignment_glb_impl_update_status():
-    # todo
-    pass
+    def get_instruction_domain_map(self):
+        def instruction_domain_map(instruction: Instruction):
+            return self.instruction_domain_mapping[instruction]
 
+        return instruction_domain_map
 
-def assignment_glb_impl_add_instruction_update_buffer_assignments(instruction, buffer_assignments, new_instruction):
-    # todo
-    pass
+    def add_store_buffer_instruction(self, buffer_assignment: BufferAssignment):
+        instruction_which_output_this_buffer = buffer_assignment.buffer.instruction
+        new_store_instr = Instruction(
+            'store',
+            [self.get_instruction_domain_map()(instruction_which_output_this_buffer)],
+            dt=instruction_which_output_this_buffer.dt,
+            shape=instruction_which_output_this_buffer.shape
+        )
+        self.instructions.append(new_store_instr)
+        self.allocator.free((buffer_assignment.address, buffer_assignment.mem_size))
+        self.buffer_assignments.remove(buffer_assignment)
+        # remapping old_inst->new_inst to old_inst->new_store_inst
+        self.instruction_domain_mapping[instruction_which_output_this_buffer] = new_store_instr
 
+    def add_load_buffer_instruction(self, instruction):
+        instruction_in_new_domain = self.get_instruction_domain_map()(instruction)
+        new_load_instr = Instruction(
+            'load',
+            [instruction_in_new_domain],
+            dt=instruction_in_new_domain.dt,
+            shape=instruction_in_new_domain.shape
+        )
+        self.instructions.append(new_load_instr)
+        alloc_result = self.allocator.alloc(self.get_instruction_output_size(new_load_instr))
+        assert (alloc_result is not None)
+        (address, mem_size) = alloc_result
+        self.buffer_assignments.add(BufferAssignment(Buffer(new_load_instr), address, mem_size))
+        # remapping old_inst->new_store_inst to old_inst->new_load_inst
+        self.instruction_domain_mapping[instruction] = new_load_instr
 
-def assignment_glb_new(
-        instructions: typing.Sequence[Instruction],
-        buffers: typing.Collection[Buffer],
-        buffer_liveness: BufferLiveness,
-        get_buffer_size: typing.Callable[[Buffer], int]
-):
-    # global_states
-    # result collections
+    def add_instruction(self, prototype: Instruction, prototype_buffers: typing.Collection[Buffer],
+                        prototype_liveness: BufferLiveness, prototype_idx: int):
+        new_instruction = prototype.copy(self.get_instruction_domain_map())
+        instruction_operands_needed_loads = [
+            operand
+            for can_use_ddr, operand
+            in zip(new_instruction.operands_can_use_ddr, new_instruction.operands)
+            if not can_use_ddr and self.get_buffer_assignment_by_instruction(operand) is None
+        ]
+        inst_input_swap_request_buffer_size = [
+            self.get_instruction_output_size(operand)
+            for operand
+            in instruction_operands_needed_loads
+        ]
+        inst_request_buffer_size = self.get_instruction_output_size(new_instruction)
 
-    for idx, instruction in zip(range(len(buffer_liveness.timeline)), buffer_liveness.timeline):
+        buffer_assignments_needs_to_be_swap = []
+        for mem_size in [inst_request_buffer_size] + inst_input_swap_request_buffer_size:
+            buffer_assignments = ensure_glb_space(
+                mem_size,
+                self.allocator,
+                self.buffer_assignments,
+                prototype_liveness,
+                prototype_idx
+            )
+            buffer_assignments_needs_to_be_swap = buffer_assignments_needs_to_be_swap + list(buffer_assignments)
 
+        # add store_instructions
+        for buffer_assignment in buffer_assignments_needs_to_be_swap:
+            self.add_store_buffer_instruction(buffer_assignment)
 
-# get resource requirements
-# request resource in global_states
-# assert if resource is not enough
-# insert store
-# insert load
-# insert copy of instruction
+        # add load_instructions
+        for operand in instruction_operands_needed_loads:
+            self.add_load_buffer_instruction(operand)
+        # update new_instruction operands pointer to load_instruction
+        new_instruction = prototype.copy(self.get_instruction_domain_map())
+
+        # add target instruction
+        self.instructions.append(new_instruction)
+        alloc_result = self.allocator.alloc(self.get_instruction_output_size(new_instruction))
+        assert (alloc_result is not None)
+        (address, mem_size) = alloc_result
+        self.buffer_assignments.add(BufferAssignment(Buffer(new_instruction), address, mem_size))
+        # remapping old_inst->new_store_inst to old_inst->new_load_inst
+        self.instruction_domain_mapping[prototype] = new_instruction
+
+        # remove operand_buffers where no more using
+        prototype_operand_buffers = [
+            Buffer.get_buffer_by_instruction(prototype_buffers, operand)
+            for can_use_ddr, operand
+            in zip(prototype.operands_can_use_ddr, prototype.operands)
+        ]
+        prototype_dead_operands = [
+            prototype_buffer.instruction
+            for prototype_buffer
+            in prototype_operand_buffers
+            if not prototype_liveness.buffer_is_alive_at_time(prototype_buffer, prototype_idx + 1)
+        ]
+        dead_operand_buffer_assignments = filter(
+            lambda x: x is not None,
+            [
+                self.get_buffer_assignment_by_instruction(self.get_instruction_domain_map()(prototype_dead_operand))
+                for prototype_dead_operand
+                in prototype_dead_operands
+            ]
+        )
+        for buffer_assignment in dead_operand_buffer_assignments:
+            self.allocator.free((buffer_assignment.address, buffer_assignment.mem_size))
+            self.buffer_assignments.remove(buffer_assignment)
 
 
 def assignment_glb(
         instructions: typing.Sequence[Instruction],
         buffers: typing.Collection[Buffer],
         buffer_liveness: BufferLiveness,
-        get_buffer_size: typing.Callable[[Buffer], int]
+        get_instruction_output_size: typing.Callable[[Instruction], int]
 ):
-    allocator = GlbAllocator(100 * 1024)  # glb size
-    # buffers_glb: typing.Collection[Buffer] = []
-    instructions_glb_assignment: typing.List[Instruction] = []
-    instruction_domain_mapping: typing.Dict[Instruction, Instruction] = {}
-    buffer_glb_assignments: typing.List[BufferAssignment] = []
+    glb_state = GlbAssignmentState(100 * 1024, get_instruction_output_size)
+    for idx, instruction in zip(range(len(instructions)), instructions):
+        glb_state.add_instruction(instruction, buffers, buffer_liveness, idx)
 
-    for idx, instruction in zip(range(len(buffer_liveness.timeline)), buffer_liveness.timeline):
-        inst_request_buffer_size = get_buffer_size(Buffer.get_buffer_by_instruction(buffers, instruction))
-        buffer_assignments_needs_to_be_swap = ensure_glb_space(
-            inst_request_buffer_size,
-            allocator,
-            buffer_glb_assignments,
-            buffer_liveness,
-            idx
-        )
-
-        def instruction_domain_map(old_inst: Instruction):
-            return instruction_domain_mapping[old_inst]
-
-        for buf_ass in buffer_assignments_needs_to_be_swap:
-            inst_of_buf_ass = buf_ass.buffer.instruction
-            new_store_instr = Instruction(
-                'store',
-                [instruction_domain_map(inst_of_buf_ass)],
-                dt=inst_of_buf_ass.dt,
-                shape=inst_of_buf_ass.shape
-            )
-            instructions_glb_assignment.append(new_store_instr)
-            # remapping old_inst->new_inst to old_inst->new_store_inst
-            instruction_domain_mapping[inst_of_buf_ass] = new_store_instr
-            allocator.free((buf_ass.address, buf_ass.mem_size))
-
-        buffer_glb_assignments = [i for i in buffer_glb_assignments if i not in buffer_assignments_needs_to_be_swap]
-
-        # add current old_inst->new_inst
-        current_new_instruction = instruction.copy(instruction_domain_map)
-        instruction_domain_mapping[instruction] = current_new_instruction
-        instructions_glb_assignment.append(current_new_instruction)
-        current_instruction_buffer = allocator.alloc(inst_request_buffer_size)
-
-        # add operand memory
-        assert (current_instruction_buffer is not None)
-        buffer_glb_assignments.append(BufferAssignment(Buffer(current_new_instruction), *current_instruction_buffer))
-
-    return [instructions_glb_assignment, buffer_glb_assignments]
+    return [glb_state.instructions, glb_state.buffer_assignments]
 
 
 def main():
