@@ -228,7 +228,7 @@ def ensure_glb_space(
         i
         for i
         in swap_list
-        if i.overlap(*allocated_mem)
+        if i.overlap(allocated_mem[0], allocated_mem[1]-allocated_mem[0])
     ]
     return really_needs_to_be_swap
 
@@ -333,7 +333,7 @@ class GlbAssignmentState:
 
         # add target instruction
         self.instructions.append(new_instruction)
-        alloc_result = self.allocator.alloc(self.get_instruction_output_size(new_instruction))
+        alloc_result = self.allocator.alloc(inst_request_buffer_size)
         assert (alloc_result is not None)
         (address, end) = alloc_result
         mem_size = end-address
