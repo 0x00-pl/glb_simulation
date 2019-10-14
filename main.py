@@ -310,18 +310,32 @@ class GlbAssignmentState:
         ]
         inst_request_buffer_size = self.get_instruction_output_size(new_instruction)
 
-        buffer_assignments_needs_to_be_swap = []
-        for mem_size in [inst_request_buffer_size] + inst_input_swap_request_buffer_size:
+        buffer_assignments_needs_to_be_swap = set()
+        for mem_size in inst_input_swap_request_buffer_size:
             buffer_assignments = ensure_glb_space(
                 mem_size,
                 self.allocator,
-                self.buffer_assignments,
+                self.buffer_assignments-buffer_assignments_needs_to_be_swap,
                 prototype_liveness,
                 prototype_idx
             )
-            buffer_assignments_needs_to_be_swap = buffer_assignments_needs_to_be_swap + list(buffer_assignments)
+            buffer_assignments_needs_to_be_swap = buffer_assignments_needs_to_be_swap + set(buffer_assignments)
 
-        # add store_instructions
+        instruction_output_can_use_ddr_result = True  # todo
+        if instruction_output_can_use_ddr_result:
+            try:
+                buffer_assignments = ensure_glb_space(
+                    inst_request_buffer_size,
+                    self.allocator,
+                    self.buffer_assignments-buffer_assignments_needs_to_be_swap,
+                    prototype_liveness,
+                    prototype_idx
+                )
+                buffer_assignments_needs_to_be_swap = buffer_assignments_needs_to_be_swap + set(buffer_assignments)
+            except ValueError:
+                instruction_output_can_use_ddr_result = False
+
+            # add store_instructions
         for buffer_assignment in buffer_assignments_needs_to_be_swap:
             self.add_store_buffer_instruction(buffer_assignment)
 
@@ -333,11 +347,12 @@ class GlbAssignmentState:
 
         # add target instruction
         self.instructions.append(new_instruction)
-        alloc_result = self.allocator.alloc(inst_request_buffer_size)
-        assert (alloc_result is not None)
-        (address, end) = alloc_result
-        mem_size = end-address
-        self.buffer_assignments.add(BufferAssignment(Buffer(new_instruction), address, mem_size))
+        if not instruction_output_can_use_ddr_result:
+            alloc_result = self.allocator.alloc(inst_request_buffer_size)
+            assert (alloc_result is not None)
+            (address, end) = alloc_result
+            mem_size = end-address
+            self.buffer_assignments.add(BufferAssignment(Buffer(new_instruction), address, mem_size))
         # remapping old_inst->new_store_inst to old_inst->new_load_inst
         self.instruction_domain_mapping[prototype] = new_instruction
 
