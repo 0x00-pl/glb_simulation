@@ -23,9 +23,10 @@ class Span:
 
 
 class BufferUse:
-    def __init__(self, instruction: Instruction, operand_idx: int = None, use_for_output: bool = False):
-        self.instruction = instruction
-        self.operand_idx = operand_idx
+    def __init__(self, used_by_instruction: Instruction, used_by_operand_idx: int,
+                 use_for_output: bool = False):
+        self.used_by_instruction = used_by_instruction
+        self.used_by_operand_idx = used_by_operand_idx
         self.use_for_output = use_for_output
         self.span: typing.Optional[Span] = None
 
@@ -34,21 +35,27 @@ class Buffer:
     def __init__(self, instruction: Instruction):
         self.instruction = instruction
         self.uses: typing.MutableSet[BufferUse] = set()
-        self.assignment: typing.Optional[Span] = None
         self.is_sub_buffer_of: Buffer = None
         self.pin_in_ddr = False
         self.buffer_type = 'ddr'
-        self.ddr_span = None
-        self.add_uses(BufferUse(instruction, use_for_output=True))
+        self.ddr_span: typing.Optional[Span] = None
+        self.add_uses(BufferUse(instruction, None, use_for_output=True))
 
     def add_uses(self, buffer_use: BufferUse):
         self.uses.add(buffer_use)
 
 
+def get_buffer_by_buffer_use(buffer_set: typing.MutableSet[Buffer], buffer_use: BufferUse):
+    for buffer in buffer_set:
+        if buffer_use in buffer.uses:
+            return buffer
+    raise ValueError()
+
+
 def get_buffer_by_instruction_output(buffer_set: typing.MutableSet[Buffer], instruction: Instruction):
     for buffer in buffer_set:
         for bu in buffer.uses:
-            if bu.use_for_output and bu.instruction == instruction:
+            if bu.use_for_output and bu.used_by_instruction == instruction:
                 return buffer
     return None
 
@@ -58,6 +65,11 @@ class InstructionChunk:
         self.instructions: typing.List[Instruction] = []
         self.buffer_set: typing.MutableSet[Buffer] = set()
         self.mem_used: int = 0
+
+    def alloc(self, mem_size):
+        ret = Span(self.mem_used, mem_size)
+        self.mem_used = self.mem_used + mem_size
+        return ret
 
     def add_instruction(self, instruction: Instruction, mem_capacity: int,
                         buffer_set: typing.MutableSet[Buffer]) -> bool:
@@ -81,24 +93,27 @@ class InstructionChunk:
                 output_buffer = Buffer(instruction)
                 buffer_set.add(output_buffer)
             else:
+                output_instruction = instruction.operands[instruction.operand_output_idx]
                 output_buffer = get_buffer_by_instruction_output(
                     buffer_set,
-                    instruction.operands[instruction.operand_output_idx]
+                    output_instruction
                 )
-                output_buffer.add_uses(BufferUse(instruction, True))
+                output_buffer.add_uses(BufferUse(instruction, instruction.operand_output_idx, True))
 
             for idx, operand in enumerate(instruction.operands):
                 # assign span, add uses
                 buffer = get_buffer_by_instruction_output(buffer_set, operand)
-                buffer.add_uses(BufferUse(operand, idx))
+                buffer.add_uses(BufferUse(instruction, idx))
                 if instruction.op == 'aggreation':
                     buffer.is_sub_buffer_of = output_buffer
 
-            if instruction.op == 'split':
+            if instruction.op == 'slice':
                 output_buffer.is_sub_buffer_of = get_buffer_by_instruction_output(buffer_set, instruction.operands[0])
 
             if instruction.op in ('const', 'input', 'output'):
                 output_buffer.pin_in_ddr = True
+
+            self.buffer_set.add(output_buffer)
 
             return True
 
@@ -106,7 +121,7 @@ class InstructionChunk:
 def get_buffer_use_by_instruction(buffer_set: typing.MutableSet[Buffer], instruction: Instruction, idx: int):
     for buffer in buffer_set:
         for buffer_use in buffer.uses:
-            if buffer_use.operand_idx == idx and buffer_use.instruction == instruction:
+            if buffer_use.used_by_operand_idx == idx and buffer_use.used_by_instruction == instruction:
                 return buffer_use
     raise ValueError()
 
@@ -171,6 +186,29 @@ def assign_local_buffer(buffer_set: typing.MutableSet[Buffer], chunk_list: typin
             bu.span = span
 
 
+def link_buffer_use_in_same_chunk_is_same(buffer_set: typing.MutableSet[Buffer],
+                                          chunk_list: typing.List[InstructionChunk]):
+    for chunk in chunk_list:
+        buffer_bu: typing.MutableMapping[Buffer, typing.Set[BufferUse]] = {}
+        for buffer in chunk.buffer_set:
+            for bu in buffer.uses:
+                # get all uses for non-virtual instruction
+                if bu.used_by_instruction in chunk.instructions and bu.used_by_instruction.is_virtual is False:
+                    if buffer_bu.get(buffer, None) is None:
+                        buffer_bu[buffer] = set()
+                    buffer_bu[buffer].add(bu)
+
+        for buffer, bu_set in buffer_bu.items():
+            span = None
+            for bu in bu_set:
+                if bu.span is not None:
+                    span = bu.span
+            if span is None:
+                span = chunk.alloc(instruction_output_to_mem_size(buffer.instruction))
+            for bu in bu_set:
+                bu.span = span
+
+
 def assign_local_buffer_for_non_virtual_instruction(buffer_set: typing.MutableSet[Buffer],
                                                     chunk_list: typing.List[InstructionChunk]):
     for chunk in chunk_list:
@@ -182,10 +220,10 @@ def assign_local_buffer_for_non_virtual_instruction(buffer_set: typing.MutableSe
             for buffer in chunk.buffer_set:
                 for buffer_use in buffer.uses:
                     if buffer_use.span is None:
-                        operand_output_idx = buffer_use.instruction.operand_output_idx
+                        operand_output_idx = buffer_use.used_by_instruction.operand_output_idx
                         if buffer_use.use_for_output and operand_output_idx is not None:
                             # outputs use same buffer of operand
-                            buffer_use.span = get_buffer_use_by_instruction(buffer_set, buffer_use.instruction,
+                            buffer_use.span = get_buffer_use_by_instruction(buffer_set, buffer_use.used_by_instruction,
                                                                             operand_output_idx).span
                         else:
                             mem_size = instruction_output_to_mem_size(buffer.instruction)
@@ -205,3 +243,29 @@ def assign_ddr_buffer_which_is_not_sub_buffer(buffer_set: typing.MutableSet[Buff
             mem_size = instruction_output_to_mem_size(buffer.instruction)
             buffer.ddr_span = Span(ddr_mem, mem_size)
             ddr_mem = ddr_mem + mem_size
+
+
+def link_instruction_post(src: Instruction, new_instruction: Instruction, instructions):
+    new_instruction.operands = [src]
+    for instruction in instructions:
+        for idx, operand in enumerate(instruction):
+            if operand == src:
+                instruction.operands[idx] = new_instruction
+
+
+def gen_code_from_chunk_list(buffer_set: typing.MutableSet[Buffer], chunk_list: typing.List[InstructionChunk]):
+    for chunk in chunk_list:
+        # collect all loads and stores
+        buffer_loads = set()
+        for instruction in chunk.instructions:
+            if instruction.is_virtual is False:
+                for operand in instruction.operands:
+                    buffer = get_buffer_by_instruction_output(chunk.buffer_set, operand)
+                    buffer_loads.add(buffer)
+        for buffer in buffer_loads:
+            link_instruction_post(
+                buffer.instruction,
+                Instruction('load', [], buffer.instruction.shape),
+                chunk.instructions
+            )
+# gen all computes and virtual-instructions
